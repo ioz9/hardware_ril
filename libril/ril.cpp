@@ -48,6 +48,7 @@
 #include <assert.h>
 #include <netinet/in.h>
 #include <cutils/properties.h>
+#include <termios.h>
 
 #include <ril_event.h>
 
@@ -142,7 +143,6 @@ typedef struct UserCallbackInfo {
     struct UserCallbackInfo *p_next;
 } UserCallbackInfo;
 
-
 /*******************************************************************/
 
 RIL_RadioFunctions s_callbacks = {0, NULL, NULL, NULL, NULL, NULL};
@@ -201,7 +201,6 @@ static void dispatchSIM_IO (Parcel& p, RequestInfo *pRI);
 static void dispatchCallForward(Parcel& p, RequestInfo *pRI);
 static void dispatchRaw(Parcel& p, RequestInfo *pRI);
 static void dispatchSmsWrite (Parcel &p, RequestInfo *pRI);
-static void dispatchDataCall (Parcel& p, RequestInfo *pRI);
 
 static void dispatchCdmaSms(Parcel &p, RequestInfo *pRI);
 static void dispatchCdmaSmsAck(Parcel &p, RequestInfo *pRI);
@@ -210,6 +209,8 @@ static void dispatchCdmaBrSmsCnf(Parcel &p, RequestInfo *pRI);
 static void dispatchRilCdmaSmsWriteArgs(Parcel &p, RequestInfo *pRI);
 static int responseInts(Parcel &p, void *response, size_t responselen);
 static int responseStrings(Parcel &p, void *response, size_t responselen);
+static int responseStringsNetworks(Parcel &p, void *response, size_t responselen);
+static int responseStrings(Parcel &p, void *response, size_t responselen, bool network_search);
 static int responseString(Parcel &p, void *response, size_t responselen);
 static int responseVoid(Parcel &p, void *response, size_t responselen);
 static int responseCallList(Parcel &p, void *response, size_t responselen);
@@ -241,8 +242,9 @@ extern "C" void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
 #endif
 
 static UserCallbackInfo * internalRequestTimedCallback
-    (RIL_TimedCallback callback, void *param,
-        const struct timeval *relativeTime);
+    (RIL_TimedCallback callback, void *param, const struct timeval *relativeTime);
+
+static void internalRemoveTimedCallback(void *callbackInfo);
 
 /** Index == requestNumber */
 static CommandInfo s_commands[] = {
@@ -488,7 +490,14 @@ dispatchInts (Parcel &p, RequestInfo *pRI) {
         int32_t t;
 
         status = p.readInt32(&t);
-        pInts[i] = (int)t;
+        /* libril-qc apparently only supports SERVICE_NONE here */
+        if (pRI->pCI->requestNumber == RIL_REQUEST_QUERY_CALL_WAITING)
+            pInts[i] = 0;
+        else if (pRI->pCI->requestNumber == RIL_REQUEST_SET_CALL_WAITING &&
+                    i == 1)
+            pInts[i] = 0;
+        else
+            pInts[i] = (int)t;
         appendPrintBuf("%s%d,", printBuf, t);
 
         if (status != NO_ERROR) {
@@ -1180,34 +1189,6 @@ invalid:
 
 }
 
-// For backwards compatibility in RIL_REQUEST_SETUP_DATA_CALL.
-// Version 4 of the RIL interface adds a new PDP type parameter to support
-// IPv6 and dual-stack PDP contexts. When dealing with a previous version of
-// RIL, remove the parameter from the request.
-static void dispatchDataCall(Parcel& p, RequestInfo *pRI) {
-    // In RIL v3, REQUEST_SETUP_DATA_CALL takes 6 parameters.
-    const int numParamsRilV3 = 6;
-
-    // The first bytes of the RIL parcel contain the request number and the
-    // serial number - see processCommandBuffer(). Copy them over too.
-    int pos = p.dataPosition();
-
-    int numParams = p.readInt32();
-    if (s_callbacks.version < 4 && numParams > numParamsRilV3) {
-      Parcel p2;
-      p2.appendFrom(&p, 0, pos);
-      p2.writeInt32(numParamsRilV3);
-      for(int i = 0; i < numParamsRilV3; i++) {
-        p2.writeString16(p.readString16());
-      }
-      p2.setDataPosition(pos);
-      dispatchStrings(p2, pRI);
-    } else {
-      p.setDataPosition(pos);
-      dispatchStrings(p, pRI);
-    }
-}
-
 static int
 blockingWrite(int fd, const void *buffer, size_t len) {
     size_t writeOffset = 0;
@@ -1313,8 +1294,16 @@ responseInts(Parcel &p, void *response, size_t responselen) {
     return 0;
 }
 
-/** response is a char **, pointing to an array of char *'s */
 static int responseStrings(Parcel &p, void *response, size_t responselen) {
+    return responseStrings(p, response, responselen, false);
+}
+
+static int responseStringsNetworks(Parcel &p, void *response, size_t responselen) {
+    return responseStrings(p, response, responselen, true);
+}
+
+/** response is a char **, pointing to an array of char *'s */
+static int responseStrings(Parcel &p, void *response, size_t responselen, bool network_search) {
     int numStrings;
 
     if (response == NULL && responselen != 0) {
@@ -1333,11 +1322,29 @@ static int responseStrings(Parcel &p, void *response, size_t responselen) {
         char **p_cur = (char **) response;
 
         numStrings = responselen / sizeof(char *);
+#ifdef NEW_LIBRIL_HTC
+        if (network_search == true) {
+            // we only want four entries for each network
+            p.writeInt32 (numStrings - (numStrings / 5));
+        } else {
+            p.writeInt32 (numStrings);
+        }
+        int sCount = 0;
+#else
         p.writeInt32 (numStrings);
+#endif
 
         /* each string*/
         startResponse;
         for (int i = 0 ; i < numStrings ; i++) {
+#ifdef NEW_LIBRIL_HTC
+            sCount++;
+            // ignore the fifth string that is returned by newer HTC libhtc_ril.so.
+            if (network_search == true && sCount % 5 == 0) {
+                sCount = 0;
+                continue;
+            }
+#endif
             appendPrintBuf("%s%s,", printBuf, (char*)p_cur[i]);
             writeStringToParcel (p, p_cur[i]);
         }
@@ -2268,7 +2275,7 @@ static void listenCallback (int fd, short flags, void *param) {
         LOGE("Error on accept() errno:%d", errno);
         /* start listening for new connections again */
         rilEventAddWakeup(&s_listen_event);
-	      return;
+        return;
     }
 
     /* check the credential of the other side and only accept socket from
@@ -2555,15 +2562,14 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
     int flags;
 
     if (callbacks == NULL || ((callbacks->version != RIL_VERSION)
-                && (callbacks->version < 2))) { // Remove when partners upgrade to version 3
+                && (callbacks->version != 2))) { // Remove when partners upgrade to version 3
         LOGE(
             "RIL_register: RIL_RadioFunctions * null or invalid version"
-            " (expected %d)", RIL_VERSION);
+            " (expected %d, was %d)", RIL_VERSION, callbacks->version);
         return;
     }
-    if (callbacks->version < RIL_VERSION) {
-        LOGE ("RIL_register: upgrade RIL to version %d current version=%d",
-              RIL_VERSION, callbacks->version);
+    if (callbacks->version < 3) {
+        LOGE ("RIL_register: upgrade RIL to version 3 current version=%d", callbacks->version);
     }
 
     if (s_registerCalled > 0) {
@@ -2681,6 +2687,157 @@ checkAndDequeueRequestInfo(struct RequestInfo *pRI) {
     return ret;
 }
 
+/* Hacks to overcome the lack of operator names in libril-qc. This
+ * fetches them from the modem */
+
+char *getNextValueFromAtLine(char **atresponse) {
+	char *value = NULL;
+
+	char *readbuf = *atresponse;
+
+	while (*readbuf != '+' && *readbuf !='\0') {
+		readbuf++;
+	}
+	if (strlen(readbuf)) {
+		value = readbuf;
+		while (*value != '"' && strlen(value)) {
+			value++;
+		}
+		value+=1;
+		readbuf=value;
+		while (*readbuf != '"' && strlen(readbuf)) {
+			readbuf++;
+		}
+		*readbuf='\0';
+		readbuf++;
+	}
+
+	*atresponse = readbuf;
+	return value;
+}
+
+
+void getNetworksFromModem(char **response) {
+	struct termios  ios;
+	char sync_buf[256];
+	char *readbuf = sync_buf;
+	char *states[4] = {"unknown","available","current","forbidden"}; 
+	int seen[16] = {0,}; /* Max 16 operators */
+	int old_flags, i, networkCount=0;
+	int fd=open("/dev/smd0",O_RDWR);
+
+	if (fd<=0) {
+		return;
+	}
+	tcgetattr( fd, &ios );
+	ios.c_lflag = 0;
+	tcsetattr( fd, TCSANOW, &ios );
+	old_flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, old_flags | O_NONBLOCK);
+
+	write(fd,"AT+COPS=?\r",10);
+	sleep(1);	
+
+	if (read(fd,sync_buf,sizeof(sync_buf))) {
+		sync_buf[255]='\0';
+		char *readbuf = sync_buf;
+		while (strlen(readbuf)) {
+			char *output[4];
+			while (*readbuf != '(' && *readbuf !='\0') {
+				readbuf++;
+			}
+			output[0]=++readbuf;
+			while (*readbuf != ',') {
+				readbuf++;
+			}
+			*readbuf='\0'; readbuf+=2;
+			output[1]=readbuf;
+			while (*readbuf != ',') {
+				readbuf++;
+			}
+			*--readbuf='\0'; readbuf+=3;
+			output[2]=readbuf;
+			while (*readbuf != ',') {
+				readbuf++;
+			}
+			*--readbuf='\0'; readbuf+=3;
+			output[3]=readbuf;
+			while (*readbuf != ',') {
+				readbuf++;
+			}
+			*--readbuf='\0'; 
+			while (*readbuf != ')') {
+				readbuf++;
+			}
+			*readbuf++='\0';
+
+			int numericOperator = atoi(output[3]);
+			for (i=0; i<16 && seen[i]!=0; i++) {
+				if (seen[i] == numericOperator)
+					goto skipop;
+			}
+			seen[networkCount] = numericOperator;
+
+			response[(networkCount*4)+0]=strdup(output[1]);
+			response[(networkCount*4)+1]=strdup(output[2]);
+			response[(networkCount*4)+2]=strdup(output[3]);
+			response[(networkCount*4)+3]=strdup(states[atoi(output[0])]);
+		
+			networkCount++;
+skipop:	
+			if (!strncmp(readbuf,",,",2)) {
+				break;
+			}
+	
+		}
+	}
+	close(fd);
+}
+
+void getOperatorFromModem(char **p_cur) {
+    struct termios  ios;
+    char sync_buf[256];
+    char *readbuf = sync_buf;
+    char *plmn=NULL;
+    char *spn=NULL;
+	int fd=open("/dev/smd0",O_RDWR);
+    int old_flags;
+	int read_bytes=0;
+
+	if (fd<=0) {
+		return;
+	}
+    old_flags = fcntl(fd, F_GETFL, 0);
+	tcgetattr( fd, &ios );
+    ios.c_lflag = 0;
+    tcsetattr( fd, TCSANOW, &ios );
+
+	write(fd,"AT+COPS=3,0;+COPS?;+COPS=3,1;+COPS?\r",36);
+	sleep(1);
+    read_bytes = read(fd,sync_buf,sizeof(sync_buf));
+    if (read_bytes) {
+        /* Skip first echoed line */
+        while (read_bytes && *readbuf != '\n' && *readbuf !='\0') {
+            readbuf++;
+			read_bytes--;
+        }
+        /* Nothing left */
+        if (!read_bytes) { return; }
+        /* Find PLMN */
+        plmn = getNextValueFromAtLine(&readbuf);
+        /* Find SPN */
+        spn = getNextValueFromAtLine(&readbuf);
+
+		if (plmn != NULL && spn != NULL &&
+				strlen(plmn) && strlen(spn)) {
+			p_cur[0]=strdup(plmn);
+			p_cur[1]=strdup(spn);
+		}
+	}
+	close(fd);
+}
+
+/* End of libril-qc "helpers" */
 
 extern "C" void
 RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responselen) {
@@ -2705,6 +2862,20 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
 
     appendPrintBuf("[%04d]< %s",
         pRI->token, requestToString(pRI->pCI->requestNumber));
+
+    if (responselen && pRI->pCI->requestNumber == RIL_REQUEST_OPERATOR) {
+        char **p_cur = (char **) response;
+        if (!strncmp(p_cur[0],"Unknown",7)) {
+            getOperatorFromModem(p_cur);
+        }
+    } else if (responselen && pRI->pCI->requestNumber == RIL_REQUEST_QUERY_AVAILABLE_NETWORKS) {
+        getNetworksFromModem((char **)response);
+    } else if (pRI->pCI->requestNumber == RIL_REQUEST_BASEBAND_VERSION) {
+        char baseband[PROPERTY_VALUE_MAX];
+
+        property_get("ro.baseband", baseband, "QCT unknown");
+        response=strdup(baseband);
+    }
 
     if (pRI->cancelled == 0) {
         Parcel p;
@@ -2892,7 +3063,7 @@ error_exit:
 */
 static UserCallbackInfo *
 internalRequestTimedCallback (RIL_TimedCallback callback, void *param,
-                                const struct timeval *relativeTime)
+                              const struct timeval *relativeTime)
 {
     struct timeval myRelativeTime;
     UserCallbackInfo *p_info;
@@ -2901,7 +3072,6 @@ internalRequestTimedCallback (RIL_TimedCallback callback, void *param,
 
     p_info->p_callback = callback;
     p_info->userParam = param;
-
     if (relativeTime == NULL) {
         /* treat null parameter as a 0 relative time */
         memset (&myRelativeTime, 0, sizeof(myRelativeTime));
@@ -2918,11 +3088,27 @@ internalRequestTimedCallback (RIL_TimedCallback callback, void *param,
     return p_info;
 }
 
+static void
+internalRemoveTimedCallback(void *callbackInfo)
+{
+    UserCallbackInfo *p_info;
+    p_info = (UserCallbackInfo *)callbackInfo;
+    LOGI("remove timer callback event");
+    if(p_info) {
+        if (ril_timer_delete(&(p_info->event)))
+			free(p_info);
+    }
+}
 
-extern "C" void
+extern "C" void *
 RIL_requestTimedCallback (RIL_TimedCallback callback, void *param,
                                 const struct timeval *relativeTime) {
-    internalRequestTimedCallback (callback, param, relativeTime);
+   return internalRequestTimedCallback (callback, param, relativeTime);
+}
+
+extern "C" void
+RIL_removeTimedCallback (void *callbackInfo) {
+    internalRemoveTimedCallback(callbackInfo);
 }
 
 const char *

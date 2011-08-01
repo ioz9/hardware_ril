@@ -40,7 +40,7 @@
 extern "C" {
 #endif
 
-#define RIL_VERSION 4
+#define RIL_VERSION 3
 
 #define CDMA_ALPHA_INFO_BUFFER_LENGTH 64
 #define CDMA_NUMBER_INFO_BUFFER_LENGTH 81

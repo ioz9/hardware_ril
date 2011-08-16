@@ -1503,8 +1503,8 @@ static int responseDataCallList(Parcel &p, void *response, size_t responselen)
             (char*)p_cur[i].type,
             (char*)p_cur[i].apn,
             (char*)p_cur[i].address);
-	if(p_cur[i].active && *((char*)p_cur[i].type)=='I')
-		system("netcfg rmnet0 dhcp");
+//	if(p_cur[i].active && *((char*)p_cur[i].type)=='I')
+//		system("netcfg rmnet0 dhcp");
     }
     removeLastChar;
     closeResponse;

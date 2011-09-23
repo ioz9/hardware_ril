@@ -2841,6 +2841,19 @@ void RIL_onUnsolicitedResponse(int unsolResponse, void *data,
             p.writeInt32(s_callbacks.onStateRequest());
             appendPrintBuf("%s {%s}", printBuf,
                 radioStateToString(s_callbacks.onStateRequest()));
+            if(s_callbacks.onStateRequest()==RADIO_STATE_SIM_LOCKED_OR_ABSENT) {
+                int data;
+                LOGI("SIM_LOCKED_OR_ABSENT: Reset Radio....");
+                data = 0;
+                issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
+                issueLocalRequest(RIL_REQUEST_RESET_RADIO, NULL, 0);
+                sleep(2);
+                data = 1;
+                issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
+                issueLocalRequest(RIL_REQUEST_SET_NETWORK_SELECTION_AUTOMATIC, NULL, 0);
+                RIL_onUnsolicitedResponse(RIL_UNSOL_RESPONSE_NETWORK_STATE_CHANGED,
+                                      NULL, 0);
+            }
         break;
 
 

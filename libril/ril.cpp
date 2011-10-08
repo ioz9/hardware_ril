@@ -190,6 +190,9 @@ static size_t s_lastNITZTimeDataSize;
     static char printBuf[PRINTBUF_SIZE];
 #endif
 
+static int registration_state=0;
+static int registration_denied_count=0;
+
 /*******************************************************************/
 
 static void dispatchVoid (Parcel& p, RequestInfo *pRI);
@@ -1578,7 +1581,6 @@ static int responseCallForwards(Parcel &p, void *response, size_t responselen) {
     startResponse;
     for (int i = 0 ; i < num ; i++) {
         RIL_CallForwardInfo *p_cur = ((RIL_CallForwardInfo **) response)[i];
-
         p.writeInt32(p_cur->status);
         p.writeInt32(p_cur->reason);
         p.writeInt32(p_cur->serviceClass);
@@ -1848,19 +1850,10 @@ static int responseRilSignalStrength(Parcel &p,
         p.writeInt32(p_cur->EVDO_SignalStrength.signalNoiseRatio);
 
         startResponse;
-        appendPrintBuf("%s[signalStrength=%d,bitErrorRate=%d,\
-                CDMA_SignalStrength.dbm=%d,CDMA_SignalStrength.ecio=%d,\
-                EVDO_SignalStrength.dbm =%d,EVDO_SignalStrength.ecio=%d,\
-                EVDO_SignalStrength.signalNoiseRatio=%d]",
+        appendPrintBuf("%s[signalStrength=%d,bitErrorRate=%d]",
                 printBuf,
                 p_cur->GW_SignalStrength.signalStrength,
-                p_cur->GW_SignalStrength.bitErrorRate,
-                p_cur->CDMA_SignalStrength.dbm,
-                p_cur->CDMA_SignalStrength.ecio,
-                p_cur->EVDO_SignalStrength.dbm,
-                p_cur->EVDO_SignalStrength.ecio,
-                p_cur->EVDO_SignalStrength.signalNoiseRatio);
-
+                p_cur->GW_SignalStrength.bitErrorRate);
         closeResponse;
 
     } else if (responselen % sizeof (int) == 0) {
@@ -2010,6 +2003,15 @@ static int responseSimStatus(Parcel &p, void *response, size_t responselen) {
 
     startResponse;
     for (i = 0; i < p_cur->num_applications; i++) {
+	if(p_cur->applications[i].app_state==RIL_APPSTATE_ILLEGAL) {
+            // if this happens, the radio is in a bad way
+            int data;
+            LOGI("SIM_APPSTATE_ILLEGAL: Power off Radio and restart rild");
+            data = 0;
+            issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
+            sleep(1);
+            exit(1);
+	}
         p.writeInt32(p_cur->applications[i].app_type);
         p.writeInt32(p_cur->applications[i].app_state);
         p.writeInt32(p_cur->applications[i].perso_substate);
@@ -2032,7 +2034,6 @@ static int responseSimStatus(Parcel &p, void *response, size_t responselen) {
                 p_cur->applications[i].pin2);
     }
     closeResponse;
-
     return 0;
 }
 
@@ -2564,6 +2565,9 @@ RIL_register (const RIL_RadioFunctions *callbacks) {
     int ret;
     int flags;
 
+    registration_state=0;
+    registration_denied_count=0;
+
     if (callbacks == NULL || ((callbacks->version != RIL_VERSION)
                 && (callbacks->version != 2))) { // Remove when partners upgrade to version 3
         LOGE(
@@ -2724,6 +2728,28 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
         p.writeInt32 (e);
 
         if (response != NULL) {
+            if(pRI->pCI->requestNumber==RIL_REQUEST_REGISTRATION_STATE) {
+                char **resp=(char **)response;
+                registration_state=atoi(resp[0]);
+                LOGI("Registration state is %d",registration_state);
+                if(registration_state==3) // registration denied
+                    registration_denied_count++;
+                else
+                    registration_denied_count=0;
+                // If we get 8 denied registrations in a row, reset the radio
+                // by powering it off and on again.
+                // This should fix a rare problem where the radio loses service.
+                if(registration_denied_count==8) {
+                    LOGI("Registration denied 8 times, Reset Radio.........");
+                    int data = 0;
+                    issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
+                    sleep(1);
+                    data = 1;
+                    issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
+                    registration_denied_count=0;
+               }
+            }
+
             // there is a response payload, no matter success or not.
             ret = pRI->pCI->responseFunction(p, response, responselen);
 
@@ -2742,6 +2768,8 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
             LOGD ("RIL onRequestComplete: Command channel closed");
         }
         sendResponse(p);
+
+
     }
 
 done:

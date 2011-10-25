@@ -192,6 +192,7 @@ static size_t s_lastNITZTimeDataSize;
 
 static int registration_state=0;
 static int registration_denied_count=0;
+static int app_state=0;
 
 /*******************************************************************/
 
@@ -2003,7 +2004,7 @@ static int responseSimStatus(Parcel &p, void *response, size_t responselen) {
 
     startResponse;
     for (i = 0; i < p_cur->num_applications; i++) {
-	if(p_cur->applications[i].app_state==RIL_APPSTATE_ILLEGAL) {
+        if(p_cur->applications[i].app_state==RIL_APPSTATE_ILLEGAL) {
             // if this happens, the radio is in a bad way
             int data;
             LOGI("SIM_APPSTATE_ILLEGAL: Power off Radio and restart rild");
@@ -2011,7 +2012,9 @@ static int responseSimStatus(Parcel &p, void *response, size_t responselen) {
             issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
             sleep(1);
             exit(1);
-	}
+        }
+        if(p_cur->applications[i].app_type!=RIL_APPTYPE_UNKNOWN)
+            app_state=p_cur->applications[i].app_state;
         p.writeInt32(p_cur->applications[i].app_type);
         p.writeInt32(p_cur->applications[i].app_state);
         p.writeInt32(p_cur->applications[i].perso_substate);
@@ -2728,7 +2731,7 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
         p.writeInt32 (e);
 
         if (response != NULL) {
-            if(pRI->pCI->requestNumber==RIL_REQUEST_REGISTRATION_STATE) {
+            if(pRI->pCI->requestNumber==RIL_REQUEST_REGISTRATION_STATE && app_state==RIL_APPSTATE_READY) {
                 char **resp=(char **)response;
                 registration_state=atoi(resp[0]);
                 LOGI("Registration state is %d",registration_state);
@@ -2736,18 +2739,18 @@ RIL_onRequestComplete(RIL_Token t, RIL_Errno e, void *response, size_t responsel
                     registration_denied_count++;
                 else
                     registration_denied_count=0;
-                // If we get 8 denied registrations in a row, reset the radio
+                // If we get 10 denied registrations in a row, reset the radio
                 // by powering it off and on again.
                 // This should fix a rare problem where the radio loses service.
-                if(registration_denied_count==8) {
-                    LOGI("Registration denied 8 times, Reset Radio.........");
+                if(registration_denied_count==10) {
+                    LOGI("Registration denied 10 times, Reset Radio.........");
                     int data = 0;
                     issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
                     sleep(1);
                     data = 1;
                     issueLocalRequest(RIL_REQUEST_RADIO_POWER, &data, sizeof(int));
                     registration_denied_count=0;
-               }
+       	        }
             }
 
             // there is a response payload, no matter success or not.
